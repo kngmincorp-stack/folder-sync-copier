@@ -11,6 +11,7 @@ import ssl
 import tempfile
 import subprocess
 import urllib.request
+import urllib.error
 
 from version import __version__, UPDATE_API_URL, APP_NAME
 
@@ -27,11 +28,18 @@ def _version_tuple(v: str):
     return tuple(parts[:3])
 
 
+# 直近の check_latest() で失敗した理由（診断用）。
+LAST_ERROR = ""
+
+
 def check_latest(timeout=10):
     """
     リモートの最新リリースを取得。
     戻り値: dict(version, url, notes) または None（取得失敗）。
+    失敗理由は updater.LAST_ERROR に入る。
     """
+    global LAST_ERROR
+    LAST_ERROR = ""
     ctx = ssl.create_default_context()
     req = urllib.request.Request(
         UPDATE_API_URL,
@@ -40,7 +48,17 @@ def check_latest(timeout=10):
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             data = json.load(resp)
-    except Exception:
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            LAST_ERROR = f"HTTP 404: リリースが見つかりません（{UPDATE_API_URL}）"
+        else:
+            LAST_ERROR = f"HTTP {e.code}: {e.reason}"
+        return None
+    except urllib.error.URLError as e:
+        LAST_ERROR = f"通信エラー: {e.reason}（ネット接続/プロキシ/ファイアウォールを確認）"
+        return None
+    except Exception as e:
+        LAST_ERROR = f"予期しないエラー: {e}"
         return None
 
     tag = data.get("tag_name") or data.get("name") or ""
@@ -50,7 +68,11 @@ def check_latest(timeout=10):
         if name.endswith(".exe"):
             exe_url = asset.get("browser_download_url")
             break
-    if not tag or not exe_url:
+    if not tag:
+        LAST_ERROR = "リリースにタグ名がありません。"
+        return None
+    if not exe_url:
+        LAST_ERROR = "リリースに .exe が添付されていません。"
         return None
     return {
         "version": tag.lstrip("vV"),

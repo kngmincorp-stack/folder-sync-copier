@@ -70,13 +70,26 @@ class CopyPair:
             log(f"[エラー] 監視元を読めません {self.src}: {e}")
             return
 
-        # 初回スキャン時、対象ファイルの検出件数をログ（動作確認しやすくする）
+        # 初回スキャン時、対象ファイルの内訳をログ（なぜコピーされる/されないかを可視化）
         if not self._announced:
             self._announced = True
             targets = [n for n in entries
                        if os.path.isfile(os.path.join(self.src, n)) and self._match_ext(n)]
             ext_label = "/".join(sorted(self.extensions)) if self.extensions else "全ファイル"
-            log(f"[監視元] {self.src} : 対象({ext_label}) {len(targets)} 件を検出")
+            already = 0
+            for n in targets:
+                dp = os.path.join(self.dst, n)
+                try:
+                    if os.path.isfile(dp) and os.path.getsize(dp) == os.path.getsize(os.path.join(self.src, n)):
+                        already += 1
+                except OSError:
+                    pass
+            to_copy = len(targets) - already
+            log(f"[監視元] {self.src}")
+            log(f"  対象({ext_label}) {len(targets)} 件 / うちコピー先に同名同サイズ既存 {already} 件 "
+                f"→ コピー予定 {to_copy} 件")
+            if targets and to_copy == 0:
+                log("  ※ 対象は全てコピー先に既にあるため、新規コピーは行われません（正常）。")
 
         current = set()
         for name in entries:

@@ -17,7 +17,7 @@ from tkinter import ttk, filedialog, messagebox
 import config
 import startup
 import updater
-from version import __version__, APP_TITLE
+from version import __version__, APP_TITLE, UPDATE_API_URL
 from watcher import CopyPair, WatchEngine
 
 
@@ -41,6 +41,9 @@ class App(tk.Tk):
         self._load_into_ui()
         self.after(120, self._drain_log)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # 起動時に版数と更新参照先をログ（別PCでどのビルドが動いているか確認用）
+        self._log(f"起動: v{__version__}  更新参照先: {UPDATE_API_URL}")
 
         # スタートアップ起動時は自動で監視開始
         if autostart:
@@ -201,7 +204,11 @@ class App(tk.Tk):
     def _check_update_worker(self):
         info = updater.check_latest()
         if not info:
-            self._log_threadsafe("[更新] 情報を取得できませんでした（配布リポジトリ未設定か通信エラー）。")
+            reason = updater.LAST_ERROR or "不明なエラー"
+            self._log_threadsafe(f"[更新] 情報を取得できませんでした: {reason}")
+            self._log_threadsafe(f"[更新] 参照先: {UPDATE_API_URL}")
+            self.after(0, lambda: messagebox.showwarning(
+                "更新確認", f"更新情報を取得できませんでした。\n\n理由: {reason}"))
             return
         if not updater.is_newer(info["version"]):
             self._log_threadsafe(f"[更新] 最新版です（現行 v{__version__}）。")
@@ -254,7 +261,27 @@ class App(tk.Tk):
         self.destroy()
 
 
+def _selftest_update():
+    """更新参照の自己診断。結果を %TEMP%\\fsc_selftest.txt に書き出して終了。
+    （--windowed の exe はコンソール出力が無いためファイルに書く。）"""
+    import os
+    import tempfile
+    import updater
+    path = os.path.join(tempfile.gettempdir(), "fsc_selftest.txt")
+    info = updater.check_latest()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"version={__version__}\n")
+        f.write(f"api={UPDATE_API_URL}\n")
+        if info:
+            f.write(f"result=OK remote={info['version']}\n")
+        else:
+            f.write(f"result=FAIL error={updater.LAST_ERROR}\n")
+
+
 def main():
+    if "--selftest-update" in sys.argv:
+        _selftest_update()
+        return
     autostart = "--autostart" in sys.argv
     app = App(autostart=autostart)
     app.mainloop()
