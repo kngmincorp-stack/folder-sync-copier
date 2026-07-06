@@ -6,8 +6,8 @@ REM  実行すると dist\FolderSyncCopier.exe が生成されます。
 REM ============================================================
 cd /d "%~dp0"
 
-echo [1/2] PyInstaller / certifi を確認しています...
-python -m pip install --quiet --upgrade pyinstaller certifi
+echo [1/2] PyInstaller / certifi / watchdog を確認しています...
+python -m pip install --quiet --upgrade pyinstaller certifi watchdog
 
 echo [2/2] exe をビルドしています...
 python -m PyInstaller --noconfirm --onefile --windowed ^
@@ -15,6 +15,7 @@ python -m PyInstaller --noconfirm --onefile --windowed ^
   --hidden-import tkinter ^
   --hidden-import certifi ^
   --collect-data certifi ^
+  --collect-all watchdog ^
   main.py
 
 echo.

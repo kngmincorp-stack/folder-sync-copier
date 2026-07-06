@@ -294,11 +294,17 @@ def _selftest_update():
         ca_info = f"{ca} (exists={os.path.isfile(ca)}, frozen={getattr(sys, 'frozen', False)})"
     except Exception as e:
         ca_info = f"certifi 読込失敗: {e}"
+    try:
+        import watcher
+        wd = f"HAS_WATCHDOG={watcher._HAS_WATCHDOG}"
+    except Exception as e:
+        wd = f"watcher読込失敗: {e}"
     info = updater.check_latest()
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"version={__version__}\n")
         f.write(f"api={UPDATE_API_URL}\n")
         f.write(f"certifi={ca_info}\n")
+        f.write(f"watchdog={wd}\n")
         if info:
             f.write(f"result=OK remote={info['version']}\n")
         else:
@@ -322,9 +328,48 @@ def _selftest_apply():
         f.write(f"apply_ok={ok} detail={detail}\n")
 
 
+def _selftest_realtime():
+    """フリーズ済みexeでリアルタイムコピーが機能するかを自己診断。
+    一時フォルダで監視を起動→ファイル作成→コピー遅延を計測し結果を書き出す。"""
+    import os
+    import time
+    import tempfile
+    import shutil
+    import watcher
+    out = os.path.join(tempfile.gettempdir(), "fsc_realtime_selftest.txt")
+    src = tempfile.mkdtemp()
+    dst = tempfile.mkdtemp()
+    try:
+        eng = watcher.WatchEngine()
+        eng.set_logger(lambda m: None)
+        eng.set_pairs([watcher.CopyPair(src, dst, extensions=[".txt"])])
+        eng.start()
+        time.sleep(1.5)
+        t0 = time.monotonic()
+        with open(os.path.join(src, "rt.txt"), "w") as f:
+            f.write("realtime-check")
+        lat = None
+        for _ in range(150):
+            if os.path.isfile(os.path.join(dst, "rt.txt")):
+                lat = time.monotonic() - t0
+                break
+            time.sleep(0.02)
+        eng.stop()
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(f"has_watchdog={watcher._HAS_WATCHDOG}\n")
+            f.write(f"latency_sec={round(lat, 3) if lat is not None else 'TIMEOUT'}\n")
+            f.write(f"copied={os.path.isfile(os.path.join(dst, 'rt.txt'))}\n")
+    finally:
+        shutil.rmtree(src, ignore_errors=True)
+        shutil.rmtree(dst, ignore_errors=True)
+
+
 def main():
     if "--selftest-update" in sys.argv:
         _selftest_update()
+        return
+    if "--selftest-realtime" in sys.argv:
+        _selftest_realtime()
         return
     if "--selftest-apply" in sys.argv:
         _selftest_apply()

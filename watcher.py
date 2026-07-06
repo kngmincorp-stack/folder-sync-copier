@@ -1,19 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-フォルダ監視 & コピーエンジン（ポーリング方式・依存ライブラリなし）。
+フォルダ監視 & コピーエンジン（リアルタイム版）。
 
-・監視元フォルダを一定間隔でスキャン。
-・新しく現れたファイルを、サイズが安定してから（＝書き込み完了後に）コピー先へコピー。
-・書き込み途中の不完全ファイルをコピーしないよう、2 回連続で同サイズを確認する。
+・watchdog（OS のファイル変更通知 / Windows は ReadDirectoryChangesW）で
+  新規ファイルを即座に検知し、書き込み完了（ロック解除）を待って即コピーする。
+  → 監視元フォルダに大量のファイルがあっても、全件を舐めずに新規だけ拾える＝リアルタイム。
+・保険として低頻度・高速（os.scandir + 台帳照合）の全体スキャンも回し、
+  通知が届かなかったファイルを取りこぼさないようにする（ネットワークドライブ対策）。
 ・コピー済みファイルは「台帳(ledger)」に記録し state.json に永続化。
-  → 2 回目以降の起動/監視では済みファイルを避け、新しく追加されたファイルだけコピーする。
-  （コピー先からファイルを移動/削除しても、済みファイルを再コピーしない。）
+  → 済みファイルは避け、新規だけコピー。コピー元/先が消えても再コピーしない。
 """
 import os
+import time
 import shutil
 import threading
 
 import state
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    _HAS_WATCHDOG = True
+except Exception:  # 取り込み失敗時はスキャンのみで動作
+    Observer = None
+    FileSystemEventHandler = object
+    _HAS_WATCHDOG = False
 
 
 class CopyPair:
@@ -22,27 +33,26 @@ class CopyPair:
     def __init__(self, src, dst, ledger=None, extensions=None):
         self.src = src
         self.dst = dst
-        self._sizes = {}                       # ファイル名 -> 前回スキャン時のサイズ（安定判定用）
+        self._sizes = {}                       # 互換用（reset_ledger で参照）
         self.ledger = set(ledger) if ledger else set()  # コピー済みキーの集合（永続化対象）
         self.dirty = False                     # 台帳に変化があったか（保存要否）
-        # コピー対象拡張子（小文字・ドット付きの集合）。None なら全ファイル対象。
-        self.extensions = None
+        self.extensions = None                 # コピー対象拡張子（小文字・ドット付き集合）
         if extensions:
             self.extensions = {e.lower() if e.startswith(".") else "." + e.lower()
                                for e in extensions}
-        self._announced = False                # 初回スキャンの検出件数ログ済みフラグ
+        self._announced = False
+
+    # ---------- 判定ヘルパ ----------
+    def valid(self) -> bool:
+        return bool(self.src) and bool(self.dst) and os.path.isdir(self.src)
+
+    def sig(self) -> str:
+        return f"{os.path.normcase(self.src)}=>{os.path.normcase(self.dst)}"
 
     def _match_ext(self, name) -> bool:
         if self.extensions is None:
             return True
         return os.path.splitext(name)[1].lower() in self.extensions
-
-    def valid(self) -> bool:
-        return bool(self.src) and bool(self.dst) and os.path.isdir(self.src)
-
-    def sig(self) -> str:
-        """組の署名（台帳の保存キー）。監視元・コピー先の組み合わせで一意。"""
-        return f"{os.path.normcase(self.src)}=>{os.path.normcase(self.dst)}"
 
     @staticmethod
     def _safe_size(path):
@@ -52,28 +62,70 @@ class CopyPair:
             return -1
 
     @staticmethod
+    def _file_key(name, size, mtime) -> str:
+        """ファイルの同一性キー。名前+サイズ+更新時刻。
+        同名でも内容が変われば別キーになり『新しく追加されたファイル』として扱う。"""
+        return f"{name}|{size}|{int(mtime)}"
+
+    @staticmethod
     def _is_locked(path) -> bool:
         """別プロセスが書き込み中（ロック中）かの簡易判定。
-        書き込み用に開ければロックされていない＝書き込み完了とみなせる。
-        開けない場合はロック中、または読み取り専用（呼び出し側でサイズ安定を保険に使う）。"""
+        書き込み用に開ければロックされていない＝書き込み完了とみなせる。"""
         try:
             with open(path, "rb+"):
                 return False
         except OSError:
             return True
 
-    @staticmethod
-    def _file_key(name, size, mtime) -> str:
-        """ファイルの同一性キー。名前+サイズ+更新時刻。
-        同名でも内容が変われば別キーになり『新しく追加されたファイル』として扱う。"""
-        return f"{name}|{size}|{int(mtime)}"
+    # ---------- コピー本体 ----------
+    def try_copy(self, name, log, size=None, mtime=None):
+        """1 ファイルをコピー判定＆コピー。
+        戻り値: 'copied' / 'skip' / 'locked'（書き込み中→呼び出し側でリトライ） / 'error'"""
+        if not self._match_ext(name):
+            return 'skip'
+        src_path = os.path.join(self.src, name)
+        if size is None or mtime is None:
+            try:
+                if not os.path.isfile(src_path):
+                    return 'skip'
+                size = os.path.getsize(src_path)
+                mtime = os.path.getmtime(src_path)
+            except OSError:
+                return 'skip'
 
-    def prime_existing(self, log=lambda m: None):
-        """初回登録時、監視元に既にあるファイルを『コピー対象』として次スキャンに委ねる。
-        （台帳が空＝初回はここでは何もせず、通常スキャンで全件コピーされる。）"""
-        return
+        key = self._file_key(name, size, mtime)
+        if key in self.ledger:
+            return 'skip'                       # 既にコピー済み
 
-    def scan_once(self, log, should_stop=None, persist_cb=None):
+        # まだ書き込み中ならリトライへ（不完全コピー防止）
+        if self._is_locked(src_path):
+            return 'locked'
+
+        dst_path = os.path.join(self.dst, name)
+        # コピー先に同名同サイズが既にあれば済み扱い（無駄コピー防止）
+        if os.path.isfile(dst_path):
+            try:
+                if os.path.getsize(dst_path) == size:
+                    self.ledger.add(key)
+                    self.dirty = True
+                    return 'skip'
+            except OSError:
+                pass
+
+        try:
+            os.makedirs(self.dst, exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            self.ledger.add(key)
+            self.dirty = True
+            return 'copied'
+        except OSError as e:
+            log(f"[エラー] コピー失敗 {name}: {e}")
+            return 'error'
+
+    # ---------- 全体スキャン（保険 / 初回バックログ） ----------
+    def scan(self, log, should_stop=None, persist_cb=None, announce=False):
+        """os.scandir で監視元を一巡し、未コピーの対象をコピーする。
+        scandir の stat キャッシュを使うため、大量ファイルでもネットワーク往復を抑えられる。"""
         if not self.valid():
             return
         try:
@@ -82,156 +134,123 @@ class CopyPair:
             log(f"[エラー] コピー先を作成できません {self.dst}: {e}")
             return
 
+        n_target = n_ledger = n_exist = n_copy = copied = errors = 0
+        aborted = False
         try:
-            entries = os.listdir(self.src)
+            scanner = os.scandir(self.src)
         except OSError as e:
             log(f"[エラー] 監視元を読めません {self.src}: {e}")
             return
 
-        # 初回スキャン時、対象ファイルの内訳をログ（なぜコピーされる/されないかを可視化）
-        # 実際のコピー判定と同じ基準（台帳＋コピー先の存在）で分類する。
-        if not self._announced:
-            self._announced = True
-            ext_label = "/".join(sorted(self.extensions)) if self.extensions else "全ファイル"
-            targets = [n for n in entries
-                       if os.path.isfile(os.path.join(self.src, n)) and self._match_ext(n)]
-            n_ledger = n_exist = n_copy = 0
-            for n in targets:
-                sp = os.path.join(self.src, n)
-                dp = os.path.join(self.dst, n)
+        with scanner:
+            for idx, entry in enumerate(scanner):
+                if should_stop and (idx & 0x3FF) == 0 and should_stop():
+                    aborted = True
+                    break
+                name = entry.name
                 try:
-                    size = os.path.getsize(sp)
-                    mtime = os.path.getmtime(sp)
-                except OSError:
-                    continue
-                if self._file_key(n, size, mtime) in self.ledger:
-                    n_ledger += 1            # 台帳に「コピー済み」記録あり → スキップ
-                elif os.path.isfile(dp) and self._safe_size(dp) == size:
-                    n_exist += 1             # コピー先に同名同サイズ既存 → スキップ
-                else:
-                    n_copy += 1              # 実際にコピーされる
-            log(f"[監視元] {self.src}")
-            log(f"  対象({ext_label}) {len(targets)} 件 ／ 台帳済み {n_ledger} 件 ／ "
-                f"コピー先に既存 {n_exist} 件 ／ 今回コピー {n_copy} 件")
-            if targets and n_copy == 0 and n_ledger > 0:
-                log("  ※ 対象は過去にコピー済み（台帳記録）のためスキップします。"
-                    "コピー先から消した物を再コピーしたい場合は［台帳をリセット］を押してください。")
-
-        current = set()
-        copied = 0        # このスキャンで実際にコピーした件数
-        errors = 0
-        aborted = False
-        for idx, name in enumerate(entries):
-            # 大量コピー中でも［停止］が効くように、時々中断を確認する
-            if should_stop and (idx & 0x1FF) == 0 and should_stop():
-                aborted = True
-                break
-
-            src_path = os.path.join(self.src, name)
-            if not os.path.isfile(src_path):
-                continue  # サブフォルダは対象外
-            if not self._match_ext(name):
-                continue  # 対象拡張子以外はスキップ（例: .txt のみ）
-            current.add(name)
-            try:
-                size = os.path.getsize(src_path)
-                mtime = os.path.getmtime(src_path)
-            except OSError:
-                continue
-
-            prev = self._sizes.get(name)
-            self._sizes[name] = size
-
-            # 書き込み完了の判定（安全側）。両方を満たしたときだけコピーする:
-            #   1) サイズが前回スキャンから変化していない（＝もう書き足されていない）
-            #   2) ファイルがロックされていない（＝書き込みハンドルが閉じられている）
-            # 部分ファイルのコピーを防ぐため、どちらか一方でも欠ければ次回に回す。
-            stable = (prev is not None and prev == size)
-            if not stable or self._is_locked(src_path):
-                continue
-
-            key = self._file_key(name, size, mtime)
-
-            # 既にコピー済み（過去の起動を含む）ならスキップ
-            if key in self.ledger:
-                continue
-
-            dst_path = os.path.join(self.dst, name)
-            # コピー先に同名同サイズが既にある場合は、コピーせず済み扱いにする
-            # （初回にコピー先へ既存ファイルがあるケースの無駄コピー防止）
-            if os.path.isfile(dst_path):
-                try:
-                    if os.path.getsize(dst_path) == size:
-                        self.ledger.add(key)
-                        self.dirty = True
+                    if not entry.is_file():
                         continue
                 except OSError:
-                    pass
+                    continue
+                if not self._match_ext(name):
+                    continue
+                try:
+                    st = entry.stat()          # scandir キャッシュ（追加の往復なし）
+                    size, mtime = st.st_size, st.st_mtime
+                except OSError:
+                    continue
 
-            try:
-                shutil.copy2(src_path, dst_path)
-                self.ledger.add(key)
-                self.dirty = True
-                copied += 1
-                # ログの洪水を防ぐ: 最初の 20 件はファイル名を表示、
-                # それ以降は 1000 件ごとに進捗のみ表示する。
-                if copied <= 20:
-                    log(f"[コピー] {name}  →  {self.dst}")
-                elif copied % 1000 == 0:
-                    log(f"  …コピー中 {copied} 件")
-                # 大量コピーを中断に強くするため、途中で台帳を保存する
-                if persist_cb and copied % 2000 == 0:
-                    persist_cb()
-            except OSError as e:
-                errors += 1
-                if errors <= 20:
-                    log(f"[エラー] コピー失敗 {name}: {e}")
+                n_target += 1
+                key = self._file_key(name, size, mtime)
+                if key in self.ledger:
+                    n_ledger += 1
+                    continue                    # 済み → 何もしない（高速）
 
-        # 消えたファイルのサイズ記録を掃除（台帳は保持し続ける）
-        for gone in list(self._sizes.keys()):
-            if gone not in current:
-                self._sizes.pop(gone, None)
+                r = self.try_copy(name, log, size=size, mtime=mtime)
+                if r == 'copied':
+                    copied += 1
+                    n_copy += 1
+                    if copied <= 20:
+                        log(f"[コピー] {name}  →  {self.dst}")
+                    elif copied % 1000 == 0:
+                        log(f"  …コピー中 {copied} 件")
+                    if persist_cb and copied % 2000 == 0:
+                        persist_cb()
+                elif r == 'skip':
+                    n_exist += 1                # コピー先に既存など
+                elif r == 'error':
+                    errors += 1
 
-        # コピーが発生したスキャンの最後に「完了通知」を出す
+        if announce and not self._announced:
+            self._announced = True
+            ext_label = "/".join(sorted(self.extensions)) if self.extensions else "全ファイル"
+            log(f"[監視元] {self.src}")
+            log(f"  対象({ext_label}) {n_target} 件 ／ 台帳済み {n_ledger} 件 ／ "
+                f"コピー先に既存など {n_exist} 件 ／ 今回コピー {n_copy} 件")
+
         if copied > 0:
             if aborted:
-                log(f"[中断] {self.src} → {self.dst} : {copied} 件コピーして停止しました。"
-                    f"残りは次回の監視開始時にコピーされます。")
+                log(f"[中断] {self.src} → {self.dst} : {copied} 件コピーして停止しました。")
             else:
                 tail = f"（うち失敗 {errors} 件）" if errors else ""
                 log(f"[完了] {self.src} → {self.dst} : {copied} 件コピーしました{tail}。")
-        if errors and copied == 0:
-            log(f"[エラー] {self.src}: コピーに {errors} 件失敗しました。")
+
+
+class _PairHandler(FileSystemEventHandler):
+    """watchdog イベント → エンジンのキューへ投入。"""
+
+    def __init__(self, engine, pair):
+        self._engine = engine
+        self._pair = pair
+
+    def _submit(self, path, is_dir):
+        if is_dir:
+            return
+        self._engine._enqueue(self._pair, os.path.basename(path))
+
+    def on_created(self, event):
+        self._submit(event.src_path, event.is_directory)
+
+    def on_modified(self, event):
+        self._submit(event.src_path, event.is_directory)
+
+    def on_moved(self, event):
+        # 一時名 → 本名 のリネームで完成するアプリに対応
+        self._submit(getattr(event, "dest_path", event.src_path), event.is_directory)
 
 
 class WatchEngine:
-    """複数の CopyPair をバックグラウンドスレッドでポーリングする。台帳は state.json に永続化。"""
+    """watchdog によるリアルタイム検知 ＋ 低頻度の保険スキャン。台帳は state.json に永続化。"""
 
-    def __init__(self, interval=2.0):
-        self.interval = interval
+    SAFETY_SCAN_INTERVAL = 15.0    # 取りこぼし対策の全体スキャン間隔（秒）
+    WORKER_TICK = 0.2              # キュー処理の間隔（秒）＝ロック解除後の追従速度
+
+    def __init__(self, interval=1.0):
         self.pairs = []
-        self._thread = None
-        self._stop = threading.Event()
         self._log_cb = lambda msg: None
         self._state = state.load()
+        self._stop = threading.Event()
+        self._worker = None
+        self._observers = []
+        self._pending = {}                       # (sig, name) -> (pair, name)  重複除去
+        self._pending_lock = threading.Lock()
 
+    # ---------- 設定 ----------
     def set_pairs(self, pairs):
-        """有効な組だけ採用し、永続化された台帳を各組に読み込む。"""
         self.pairs = []
         for p in pairs:
             if not p.valid():
                 continue
-            saved = self._state.get(p.sig(), [])
-            p.ledger = set(saved)
+            p.ledger = set(self._state.get(p.sig(), []))
             p.dirty = False
+            p._announced = False
             self.pairs.append(p)
 
     def set_logger(self, cb):
         self._log_cb = cb
 
     def reset_ledger(self):
-        """コピー済み台帳を全消去し、state.json も空にする。
-        以後の監視で、コピー先に無い対象ファイルは再びコピーされる。"""
         self._state = {}
         for p in self.pairs:
             p.ledger = set()
@@ -242,20 +261,21 @@ class WatchEngine:
 
     @property
     def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return self._worker is not None and self._worker.is_alive()
 
-    def start(self):
-        if self.running:
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+    # ---------- キュー ----------
+    def _enqueue(self, pair, name):
+        with self._pending_lock:
+            self._pending[(pair.sig(), name)] = (pair, name)
 
-    def stop(self):
-        self._stop.set()
+    def _drain(self):
+        with self._pending_lock:
+            batch = list(self._pending.values())
+            self._pending = {}
+        return batch
 
+    # ---------- 永続化 ----------
     def _persist(self):
-        """台帳に変化があれば state.json に保存。"""
         changed = False
         for p in self.pairs:
             if p.dirty:
@@ -265,18 +285,88 @@ class WatchEngine:
         if changed:
             state.save(self._state)
 
-    def _run(self):
-        n = sum(1 for _ in self.pairs)
-        self._log_cb(f"監視を開始しました（{n} 組）。既にコピー済みのファイルはスキップします。")
-        while not self._stop.is_set():
-            for pair in self.pairs:
+    # ---------- 起動/停止 ----------
+    def start(self):
+        if self.running:
+            return
+        self._stop.clear()
+        # リアルタイム検知（watchdog）を各監視元に仕掛ける
+        self._observers = []
+        rt = 0
+        if _HAS_WATCHDOG:
+            for p in self.pairs:
                 try:
-                    pair.scan_once(self._log_cb,
-                                   should_stop=self._stop.is_set,
-                                   persist_cb=self._persist)
-                except Exception as e:  # スレッドを絶対に落とさない
-                    self._log_cb(f"[例外] {e}")
-            self._persist()
-            self._stop.wait(self.interval)
+                    obs = Observer()
+                    obs.schedule(_PairHandler(self, p), p.src, recursive=False)
+                    obs.start()
+                    self._observers.append(obs)
+                    rt += 1
+                except Exception as e:
+                    self._log_cb(f"[注意] {p.src} のリアルタイム監視を開始できません: {e}")
+        self._worker = threading.Thread(target=self._run, args=(rt,), daemon=True)
+        self._worker.start()
+
+    def stop(self):
+        self._stop.set()
+        for obs in self._observers:
+            try:
+                obs.stop()
+            except Exception:
+                pass
+        for obs in self._observers:
+            try:
+                obs.join(timeout=2)
+            except Exception:
+                pass
+        self._observers = []
+
+    # ---------- ワーカー ----------
+    def _run(self, realtime_count):
+        n = len(self.pairs)
+        mode = "リアルタイム監視" if realtime_count == n and n > 0 else \
+               ("一部リアルタイム＋定期スキャン" if realtime_count else "定期スキャン")
+        self._log_cb(f"監視を開始しました（{n} 組・{mode}）。既存のコピー済みファイルはスキップします。")
+
+        # 初回: 監視開始前から在るファイル / 未コピー分を拾う（scandir で高速）
+        for p in self.pairs:
+            try:
+                p.scan(self._log_cb, should_stop=self._stop.is_set,
+                       persist_cb=self._persist, announce=True)
+            except Exception as e:
+                self._log_cb(f"[例外] 初回スキャン {p.src}: {e}")
+        self._persist()
+
+        last_safety = time.monotonic()
+        while not self._stop.is_set():
+            # リアルタイム: 通知で溜まった新規ファイルを処理
+            batch = self._drain()
+            copied = 0
+            for pair, name in batch:
+                try:
+                    r = pair.try_copy(name, self._log_cb)
+                except Exception as e:
+                    self._log_cb(f"[例外] {name}: {e}")
+                    continue
+                if r == 'locked':
+                    self._enqueue(pair, name)        # まだ書き込み中 → 次tickで再試行
+                elif r == 'copied':
+                    copied += 1
+                    self._log_cb(f"[コピー] {name}  →  {pair.dst}")
+            if copied:
+                self._persist()
+
+            # 保険: 低頻度の全体スキャン（通知が届かない環境でも取りこぼさない）
+            if time.monotonic() - last_safety >= self.SAFETY_SCAN_INTERVAL:
+                for p in self.pairs:
+                    try:
+                        p.scan(self._log_cb, should_stop=self._stop.is_set,
+                               persist_cb=self._persist)
+                    except Exception as e:
+                        self._log_cb(f"[例外] 定期スキャン {p.src}: {e}")
+                self._persist()
+                last_safety = time.monotonic()
+
+            self._stop.wait(self.WORKER_TICK)
+
         self._persist()
         self._log_cb("監視を停止しました。")
