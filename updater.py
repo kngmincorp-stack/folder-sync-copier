@@ -16,6 +16,17 @@ import urllib.error
 from version import __version__, UPDATE_API_URL, APP_NAME
 
 
+def _ssl_context():
+    """SSL コンテキストを作る。
+    配布先PCにルート証明書が無くても検証できるよう、certifi 同梱の CA バンドルを使う。
+    （CERTIFICATE_VERIFY_FAILED 対策。certifi が無ければ OS 既定にフォールバック。）"""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 def _version_tuple(v: str):
     """'1.2.3' -> (1, 2, 3) 。比較用に数値化する。"""
     v = v.strip().lstrip("vV")
@@ -40,7 +51,7 @@ def check_latest(timeout=10):
     """
     global LAST_ERROR
     LAST_ERROR = ""
-    ctx = ssl.create_default_context()
+    ctx = _ssl_context()
     req = urllib.request.Request(
         UPDATE_API_URL,
         headers={"User-Agent": APP_NAME, "Accept": "application/vnd.github+json"},
@@ -103,7 +114,7 @@ def download_and_apply(download_url: str, timeout=60):
     tmp_dir = tempfile.gettempdir()
     new_exe = os.path.join(tmp_dir, f"{APP_NAME}_new.exe")
 
-    ctx = ssl.create_default_context()
+    ctx = _ssl_context()
     req = urllib.request.Request(download_url, headers={"User-Agent": APP_NAME})
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp, \

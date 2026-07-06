@@ -268,10 +268,17 @@ def _selftest_update():
     import tempfile
     import updater
     path = os.path.join(tempfile.gettempdir(), "fsc_selftest.txt")
+    try:
+        import certifi
+        ca = certifi.where()
+        ca_info = f"{ca} (exists={os.path.isfile(ca)}, frozen={getattr(sys, 'frozen', False)})"
+    except Exception as e:
+        ca_info = f"certifi 読込失敗: {e}"
     info = updater.check_latest()
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"version={__version__}\n")
         f.write(f"api={UPDATE_API_URL}\n")
+        f.write(f"certifi={ca_info}\n")
         if info:
             f.write(f"result=OK remote={info['version']}\n")
         else:
