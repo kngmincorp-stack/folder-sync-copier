@@ -117,19 +117,37 @@ def download_and_apply(download_url: str, timeout=60):
 
     ctx = _ssl_context()
     req = urllib.request.Request(download_url, headers={"User-Agent": APP_NAME})
+    expected = None
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp, \
                 open(new_exe, "wb") as f:
-            f.write(resp.read())
+            cl = resp.headers.get("Content-Length")
+            if cl and cl.isdigit():
+                expected = int(cl)
+            # 逐次書き込み＋ディスクへ確実にフラッシュ
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
     except Exception as e:
         return False, f"ダウンロード失敗: {e}"
 
-    # ダウンロード結果を軽く検証（壊れた exe を掴まないように）
+    # ダウンロード結果を厳密に検証（不完全な exe を掴むと
+    # 起動時に『Failed to load Python DLL / モジュールが見つかりません』になる）
     try:
+        actual = os.path.getsize(new_exe)
         with open(new_exe, "rb") as f:
             head = f.read(2)
-        if head != b"MZ" or os.path.getsize(new_exe) < 100000:
-            return False, "ダウンロードした更新ファイルが不正です（再試行してください）。"
+        if head != b"MZ":
+            return False, "更新ファイルが不正です（exe ではありません）。再試行してください。"
+        if actual < 1_000_000:
+            return False, f"更新ファイルが小さすぎます（{actual} bytes）。再試行してください。"
+        if expected is not None and actual != expected:
+            return False, (f"ダウンロードが不完全です（{actual}/{expected} bytes）。"
+                           "通信状況を確認して再試行してください。")
     except OSError as e:
         return False, f"更新ファイル検証失敗: {e}"
 
