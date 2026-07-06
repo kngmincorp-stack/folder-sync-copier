@@ -73,7 +73,7 @@ class CopyPair:
         （台帳が空＝初回はここでは何もせず、通常スキャンで全件コピーされる。）"""
         return
 
-    def scan_once(self, log):
+    def scan_once(self, log, should_stop=None, persist_cb=None):
         if not self.valid():
             return
         try:
@@ -118,7 +118,15 @@ class CopyPair:
                     "コピー先から消した物を再コピーしたい場合は［台帳をリセット］を押してください。")
 
         current = set()
-        for name in entries:
+        copied = 0        # このスキャンで実際にコピーした件数
+        errors = 0
+        aborted = False
+        for idx, name in enumerate(entries):
+            # 大量コピー中でも［停止］が効くように、時々中断を確認する
+            if should_stop and (idx & 0x1FF) == 0 and should_stop():
+                aborted = True
+                break
+
             src_path = os.path.join(self.src, name)
             if not os.path.isfile(src_path):
                 continue  # サブフォルダは対象外
@@ -164,14 +172,36 @@ class CopyPair:
                 shutil.copy2(src_path, dst_path)
                 self.ledger.add(key)
                 self.dirty = True
-                log(f"[コピー] {name}  →  {self.dst}")
+                copied += 1
+                # ログの洪水を防ぐ: 最初の 20 件はファイル名を表示、
+                # それ以降は 1000 件ごとに進捗のみ表示する。
+                if copied <= 20:
+                    log(f"[コピー] {name}  →  {self.dst}")
+                elif copied % 1000 == 0:
+                    log(f"  …コピー中 {copied} 件")
+                # 大量コピーを中断に強くするため、途中で台帳を保存する
+                if persist_cb and copied % 2000 == 0:
+                    persist_cb()
             except OSError as e:
-                log(f"[エラー] コピー失敗 {name}: {e}")
+                errors += 1
+                if errors <= 20:
+                    log(f"[エラー] コピー失敗 {name}: {e}")
 
         # 消えたファイルのサイズ記録を掃除（台帳は保持し続ける）
         for gone in list(self._sizes.keys()):
             if gone not in current:
                 self._sizes.pop(gone, None)
+
+        # コピーが発生したスキャンの最後に「完了通知」を出す
+        if copied > 0:
+            if aborted:
+                log(f"[中断] {self.src} → {self.dst} : {copied} 件コピーして停止しました。"
+                    f"残りは次回の監視開始時にコピーされます。")
+            else:
+                tail = f"（うち失敗 {errors} 件）" if errors else ""
+                log(f"[完了] {self.src} → {self.dst} : {copied} 件コピーしました{tail}。")
+        if errors and copied == 0:
+            log(f"[エラー] {self.src}: コピーに {errors} 件失敗しました。")
 
 
 class WatchEngine:
@@ -241,7 +271,9 @@ class WatchEngine:
         while not self._stop.is_set():
             for pair in self.pairs:
                 try:
-                    pair.scan_once(self._log_cb)
+                    pair.scan_once(self._log_cb,
+                                   should_stop=self._stop.is_set,
+                                   persist_cb=self._persist)
                 except Exception as e:  # スレッドを絶対に落とさない
                     self._log_cb(f"[例外] {e}")
             self._persist()
