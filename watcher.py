@@ -45,6 +45,13 @@ class CopyPair:
         return f"{os.path.normcase(self.src)}=>{os.path.normcase(self.dst)}"
 
     @staticmethod
+    def _safe_size(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return -1
+
+    @staticmethod
     def _file_key(name, size, mtime) -> str:
         """ファイルの同一性キー。名前+サイズ+更新時刻。
         同名でも内容が変われば別キーになり『新しく追加されたファイル』として扱う。"""
@@ -71,25 +78,33 @@ class CopyPair:
             return
 
         # 初回スキャン時、対象ファイルの内訳をログ（なぜコピーされる/されないかを可視化）
+        # 実際のコピー判定と同じ基準（台帳＋コピー先の存在）で分類する。
         if not self._announced:
             self._announced = True
+            ext_label = "/".join(sorted(self.extensions)) if self.extensions else "全ファイル"
             targets = [n for n in entries
                        if os.path.isfile(os.path.join(self.src, n)) and self._match_ext(n)]
-            ext_label = "/".join(sorted(self.extensions)) if self.extensions else "全ファイル"
-            already = 0
+            n_ledger = n_exist = n_copy = 0
             for n in targets:
+                sp = os.path.join(self.src, n)
                 dp = os.path.join(self.dst, n)
                 try:
-                    if os.path.isfile(dp) and os.path.getsize(dp) == os.path.getsize(os.path.join(self.src, n)):
-                        already += 1
+                    size = os.path.getsize(sp)
+                    mtime = os.path.getmtime(sp)
                 except OSError:
-                    pass
-            to_copy = len(targets) - already
+                    continue
+                if self._file_key(n, size, mtime) in self.ledger:
+                    n_ledger += 1            # 台帳に「コピー済み」記録あり → スキップ
+                elif os.path.isfile(dp) and self._safe_size(dp) == size:
+                    n_exist += 1             # コピー先に同名同サイズ既存 → スキップ
+                else:
+                    n_copy += 1              # 実際にコピーされる
             log(f"[監視元] {self.src}")
-            log(f"  対象({ext_label}) {len(targets)} 件 / うちコピー先に同名同サイズ既存 {already} 件 "
-                f"→ コピー予定 {to_copy} 件")
-            if targets and to_copy == 0:
-                log("  ※ 対象は全てコピー先に既にあるため、新規コピーは行われません（正常）。")
+            log(f"  対象({ext_label}) {len(targets)} 件 ／ 台帳済み {n_ledger} 件 ／ "
+                f"コピー先に既存 {n_exist} 件 ／ 今回コピー {n_copy} 件")
+            if targets and n_copy == 0 and n_ledger > 0:
+                log("  ※ 対象は過去にコピー済み（台帳記録）のためスキップします。"
+                    "コピー先から消した物を再コピーしたい場合は［台帳をリセット］を押してください。")
 
         current = set()
         for name in entries:
@@ -168,6 +183,17 @@ class WatchEngine:
 
     def set_logger(self, cb):
         self._log_cb = cb
+
+    def reset_ledger(self):
+        """コピー済み台帳を全消去し、state.json も空にする。
+        以後の監視で、コピー先に無い対象ファイルは再びコピーされる。"""
+        self._state = {}
+        for p in self.pairs:
+            p.ledger = set()
+            p._sizes = {}
+            p._announced = False
+            p.dirty = False
+        state.save(self._state)
 
     @property
     def running(self) -> bool:

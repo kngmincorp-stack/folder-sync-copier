@@ -102,6 +102,7 @@ class App(tk.Tk):
             command=self._toggle_startup,
         ).pack(side="left")
         ttk.Button(opt, text="更新を確認", command=self._check_update).pack(side="right")
+        ttk.Button(opt, text="台帳をリセット", command=self._reset_ledger).pack(side="right", padx=6)
 
         # 操作ボタン
         btns = ttk.Frame(self)
@@ -183,6 +184,19 @@ class App(tk.Tk):
     def _set_entries_state(self, state):
         # 監視中は入力を触れないようにする（表示のみ簡易ロック）
         pass
+
+    def _reset_ledger(self):
+        if not messagebox.askyesno(
+                "台帳をリセット",
+                "コピー済みの記録（台帳）を全て消去します。\n\n"
+                "監視中の場合、コピー先に無い対象ファイルは\n再びコピーされます。よろしいですか？"):
+            return
+        # 監視中でない場合でも state.json を確実に空にするため、
+        # 現在の設定で一度 pairs を engine に読み込ませてからリセットする。
+        if not self.engine.running:
+            self.engine.set_pairs(self._collect_pairs())
+        self.engine.reset_ledger()
+        self._log("台帳をリセットしました。コピー先に無い対象ファイルは再コピーされます。")
 
     def _toggle_startup(self):
         try:
