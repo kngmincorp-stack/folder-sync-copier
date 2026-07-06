@@ -21,7 +21,7 @@ DEFAULT = {
         {"src": "", "dst": ""},
     ],
     "startup": False,
-    "interval": 2.0,
+    "interval": 1.0,
     # コピー対象の拡張子（小文字・ドット付き）。None にすると全ファイル対象。
     "extensions": [".txt"],
 }
@@ -39,6 +39,12 @@ def load() -> dict:
         while len(pairs) < 2:
             pairs.append({"src": "", "dst": ""})
         merged["pairs"] = pairs[:2]
+        # 旧デフォルト(2.0秒)は応答が遅いので、明示的に大きい値でなければ 1.0 に引き下げる
+        try:
+            if float(merged.get("interval", 1.0)) >= 2.0:
+                merged["interval"] = 1.0
+        except (TypeError, ValueError):
+            merged["interval"] = 1.0
         return merged
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return json.loads(json.dumps(DEFAULT))

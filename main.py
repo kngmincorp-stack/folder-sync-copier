@@ -29,7 +29,7 @@ class App(tk.Tk):
         self.minsize(640, 500)
 
         self.cfg = config.load()
-        self.engine = WatchEngine(interval=self.cfg.get("interval", 2.0))
+        self.engine = WatchEngine(interval=self.cfg.get("interval", 1.0))
         self.engine.set_logger(self._log_threadsafe)
         self._log_queue = queue.Queue()
 

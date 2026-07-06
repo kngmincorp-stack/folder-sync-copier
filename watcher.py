@@ -52,6 +52,17 @@ class CopyPair:
             return -1
 
     @staticmethod
+    def _is_locked(path) -> bool:
+        """別プロセスが書き込み中（ロック中）かの簡易判定。
+        書き込み用に開ければロックされていない＝書き込み完了とみなせる。
+        開けない場合はロック中、または読み取り専用（呼び出し側でサイズ安定を保険に使う）。"""
+        try:
+            with open(path, "rb+"):
+                return False
+        except OSError:
+            return True
+
+    @staticmethod
     def _file_key(name, size, mtime) -> str:
         """ファイルの同一性キー。名前+サイズ+更新時刻。
         同名でも内容が変われば別キーになり『新しく追加されたファイル』として扱う。"""
@@ -123,8 +134,12 @@ class CopyPair:
             prev = self._sizes.get(name)
             self._sizes[name] = size
 
-            # まだサイズが変動中（書き込み中）なら次回に回す
-            if prev is None or prev != size:
+            # 書き込み完了の判定（安全側）。両方を満たしたときだけコピーする:
+            #   1) サイズが前回スキャンから変化していない（＝もう書き足されていない）
+            #   2) ファイルがロックされていない（＝書き込みハンドルが閉じられている）
+            # 部分ファイルのコピーを防ぐため、どちらか一方でも欠ければ次回に回す。
+            stable = (prev is not None and prev == size)
+            if not stable or self._is_locked(src_path):
                 continue
 
             key = self._file_key(name, size, mtime)
