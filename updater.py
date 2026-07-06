@@ -113,6 +113,7 @@ def download_and_apply(download_url: str, timeout=60):
     current_exe = sys.executable  # 実行中の exe パス
     tmp_dir = tempfile.gettempdir()
     new_exe = os.path.join(tmp_dir, f"{APP_NAME}_new.exe")
+    log_path = os.path.join(tmp_dir, f"{APP_NAME}_update.log")
 
     ctx = _ssl_context()
     req = urllib.request.Request(download_url, headers={"User-Agent": APP_NAME})
@@ -123,30 +124,62 @@ def download_and_apply(download_url: str, timeout=60):
     except Exception as e:
         return False, f"ダウンロード失敗: {e}"
 
+    # ダウンロード結果を軽く検証（壊れた exe を掴まないように）
+    try:
+        with open(new_exe, "rb") as f:
+            head = f.read(2)
+        if head != b"MZ" or os.path.getsize(new_exe) < 100000:
+            return False, "ダウンロードした更新ファイルが不正です（再試行してください）。"
+    except OSError as e:
+        return False, f"更新ファイル検証失敗: {e}"
+
     # 実行中の exe はロックされているため、終了を待ってから差し替える必要がある。
     # バッチで「本体終了待ち → 上書き → 再起動」を行う。
+    # 重要: 日本語(CP932)環境の cmd.exe に合わせ、バッチは ASCII コマンドのみ・
+    #       ファイルはシステム既定コードページ(mbcs)で書き出す。
+    #       （UTF-8+chcp だと日本語フォルダに置いた exe のパスが化けて
+    #        「指定されたモジュールが見つかりません」になるため。）
+    # onefile の exe は「親(bootloader)＋子(アプリ)」の 2 プロセスで動くため、
+    # アプリ終了直後も一瞬 exe ファイルがロックされたままになる。
+    # PID を待つのではなく、「置換に成功するまで move をリトライ」する方が確実。
     bat = os.path.join(tmp_dir, f"{APP_NAME}_update.bat")
-    bat_content = f"""@echo off
-chcp 65001 >nul
-echo アップデートを適用しています...
-:waitloop
-tasklist /FI "IMAGENAME eq {os.path.basename(current_exe)}" | find /I "{os.path.basename(current_exe)}" >nul
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto waitloop
-)
-move /Y "{new_exe}" "{current_exe}" >nul
-start "" "{current_exe}"
-del "%~f0"
-"""
+    bat_content = (
+        "@echo off\r\n"
+        f'set "LOG={log_path}"\r\n'
+        f'set "NEW={new_exe}"\r\n'
+        f'set "DST={current_exe}"\r\n'
+        '> "%LOG%" echo [update] start; waiting for file lock to release\r\n'
+        "set /a tries=0\r\n"
+        ":retry\r\n"
+        'move /Y "%NEW%" "%DST%" >> "%LOG%" 2>&1\r\n'
+        "if not errorlevel 1 goto done\r\n"
+        "set /a tries+=1\r\n"
+        'if %tries% GEQ 40 goto giveup\r\n'
+        "ping -n 2 127.0.0.1 >nul\r\n"
+        "goto retry\r\n"
+        ":done\r\n"
+        '>> "%LOG%" echo [update] replaced OK after %tries% retries; launching\r\n'
+        f'start "" "{current_exe}"\r\n'
+        '>> "%LOG%" echo [update] done\r\n'
+        'del "%~f0"\r\n'
+        "goto :eof\r\n"
+        ":giveup\r\n"
+        '>> "%LOG%" echo [update] FAILED: could not replace exe (still locked)\r\n'
+        f'start "" "{current_exe}"\r\n'
+        'del "%~f0"\r\n'
+    )
     try:
-        with open(bat, "w", encoding="utf-8") as f:
+        enc = "mbcs" if os.name == "nt" else "utf-8"
+        with open(bat, "w", encoding=enc, errors="replace") as f:
             f.write(bat_content)
     except Exception as e:
         return False, f"更新スクリプト作成失敗: {e}"
 
-    subprocess.Popen(
-        ["cmd", "/c", bat],
-        creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
-    )
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", bat],
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except Exception as e:
+        return False, f"更新プロセス起動失敗: {e}"
     return True, "更新を適用します。アプリを再起動します。"

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """バージョン情報。パッチ更新システムはこの値をリモートと比較する。"""
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 APP_NAME = "FolderSyncCopier"
 APP_TITLE = "フォルダ同期コピー"
 

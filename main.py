@@ -299,9 +299,29 @@ def _selftest_update():
             f.write(f"result=FAIL error={updater.LAST_ERROR}\n")
 
 
+def _selftest_apply():
+    """更新適用（ダウンロード→自己置換→再起動）の自己診断。
+    最新リリースを取得して download_and_apply を実行し、結果をファイルに残して終了する。"""
+    import os
+    import tempfile
+    import updater
+    path = os.path.join(tempfile.gettempdir(), "fsc_apply_selftest.txt")
+    info = updater.check_latest()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"exe={sys.executable}\n")
+        if not info:
+            f.write(f"result=FAIL check error={updater.LAST_ERROR}\n")
+            return
+        ok, detail = updater.download_and_apply(info["url"])
+        f.write(f"apply_ok={ok} detail={detail}\n")
+
+
 def main():
     if "--selftest-update" in sys.argv:
         _selftest_update()
+        return
+    if "--selftest-apply" in sys.argv:
+        _selftest_apply()
         return
     autostart = "--autostart" in sys.argv
     app = App(autostart=autostart)
