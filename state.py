@@ -33,8 +33,18 @@ def load() -> dict:
 
 
 def save(data: dict):
+    # アトミック保存: 一時ファイルに書いてから置換する。
+    # コピー処理中にアプリが落ちても、台帳(state.json)が途中書きで壊れない。
+    tmp = STATE_PATH + ".tmp"
     try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, STATE_PATH)   # 同一ボリューム内で原子的に差し替え
     except OSError:
-        pass
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
