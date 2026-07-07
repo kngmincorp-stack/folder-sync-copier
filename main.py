@@ -35,6 +35,17 @@ class App(tk.Tk):
 
         self.src_vars = []
         self.dst_vars = []
+
+        # スタートアップ自己修復:
+        # 設定で有効なのに登録が消えている/古い exe を指している/
+        # タスクマネージャーで無効化されている場合は、起動のたびに直す。
+        self._startup_heal_msg = None
+        if self.cfg.get("startup"):
+            try:
+                self._startup_heal_msg = startup.heal()
+            except Exception as e:
+                self._startup_heal_msg = f"自己修復に失敗しました: {e}"
+
         self.startup_var = tk.BooleanVar(value=startup.is_enabled())
 
         self._build_ui()
@@ -44,6 +55,14 @@ class App(tk.Tk):
 
         # 起動時に版数と更新参照先をログ（別PCでどのビルドが動いているか確認用）
         self._log(f"起動: v{__version__}  更新参照先: {UPDATE_API_URL}")
+
+        # スタートアップ登録の状態をログ（起動しない問題の切り分け用）
+        if self._startup_heal_msg:
+            self._log(f"[スタートアップ] {self._startup_heal_msg}")
+        if self.startup_var.get():
+            self._log(f"[スタートアップ] 登録コマンド: {startup.registered_command()}")
+            if not startup.is_approved():
+                self._log("[スタートアップ] 警告: タスクマネージャーで無効化されています。")
 
         # スタートアップ起動時は自動で監視開始
         if autostart:
