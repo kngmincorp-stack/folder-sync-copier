@@ -102,10 +102,11 @@ def is_frozen() -> bool:
     return getattr(sys, "frozen", False)
 
 
-def download_and_apply(download_url: str, timeout=60):
+def download_and_apply(download_url: str, timeout=60, autostart=False):
     """
     新しい exe をダウンロードし、バッチ経由で自身を差し替えて再起動する。
     exe 実行時のみ有効（スクリプト実行時は False を返す）。
+    autostart=True なら再起動後に自動で監視を開始する（--autostart 付きで起動）。
     """
     if not is_frozen():
         return False, "exe 実行時のみ自動更新できます（開発中はスキップ）。"
@@ -160,9 +161,20 @@ def download_and_apply(download_url: str, timeout=60):
     # onefile の exe は「親(bootloader)＋子(アプリ)」の 2 プロセスで動くため、
     # アプリ終了直後も一瞬 exe ファイルがロックされたままになる。
     # PID を待つのではなく、「置換に成功するまで move をリトライ」する方が確実。
+    # 重要: onefile 実行中のプロセスは _PYI_APPLICATION_HOME_DIR 等の環境変数で
+    #       「自分の展開先(_MEIxxxx)」を子プロセスへ伝えている。これが bat 経由で
+    #       新 exe に継承されると、新 exe は旧 exe の展開フォルダ（終了時に削除済み）
+    #       から python DLL を読もうとして『Failed to load Python DLL /
+    #       指定されたモジュールが見つかりません』で起動に失敗する。
+    #       → bat 内で明示的に消し、Popen にも除去済み環境を渡す（二重防御）。
+    relaunch_args = " --autostart" if autostart else ""
     bat = os.path.join(tmp_dir, f"{APP_NAME}_update.bat")
     bat_content = (
         "@echo off\r\n"
+        'set "_PYI_APPLICATION_HOME_DIR="\r\n'
+        'set "_PYI_ARCHIVE_FILE="\r\n'
+        'set "_PYI_PARENT_PROCESS_LEVEL="\r\n'
+        'set "_MEIPASS2="\r\n'
         f'set "LOG={log_path}"\r\n'
         f'set "NEW={new_exe}"\r\n'
         f'set "DST={current_exe}"\r\n'
@@ -177,13 +189,13 @@ def download_and_apply(download_url: str, timeout=60):
         "goto retry\r\n"
         ":done\r\n"
         '>> "%LOG%" echo [update] replaced OK after %tries% retries; launching\r\n'
-        f'start "" "{current_exe}"\r\n'
+        f'start "" "{current_exe}"{relaunch_args}\r\n'
         '>> "%LOG%" echo [update] done\r\n'
         'del "%~f0"\r\n'
         "goto :eof\r\n"
         ":giveup\r\n"
         '>> "%LOG%" echo [update] FAILED: could not replace exe (still locked)\r\n'
-        f'start "" "{current_exe}"\r\n'
+        f'start "" "{current_exe}"{relaunch_args}\r\n'
         'del "%~f0"\r\n'
     )
     try:
@@ -193,9 +205,13 @@ def download_and_apply(download_url: str, timeout=60):
     except Exception as e:
         return False, f"更新スクリプト作成失敗: {e}"
 
+    # PyInstaller が仕込んだ環境変数を除いたクリーンな環境で bat を起動する
+    clean_env = {k: v for k, v in os.environ.items()
+                 if not (k.startswith("_PYI") or k.startswith("_MEI"))}
     try:
         subprocess.Popen(
             ["cmd", "/c", bat],
+            env=clean_env,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except Exception as e:

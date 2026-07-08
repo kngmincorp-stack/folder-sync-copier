@@ -294,7 +294,9 @@ class App(tk.Tk):
                f"現行: v{__version__}\n\n更新しますか？（更新後に再起動します）")
         if not messagebox.askyesno("更新があります", msg):
             return
-        ok, detail = updater.download_and_apply(info["url"])
+        # 監視中に更新した場合は、再起動後に自動で監視を再開する
+        ok, detail = updater.download_and_apply(info["url"],
+                                                autostart=self.engine.running)
         self._log(f"[更新] {detail}")
         if ok:
             self.after(500, self._quit_for_update)
@@ -352,11 +354,16 @@ def _selftest_update():
     except Exception as e:
         wd = f"watcher読込失敗: {e}"
     info = updater.check_latest()
+    # PyInstaller onefile が子プロセスへ漏らす環境変数（更新後の再起動が
+    # 「Failed to load Python DLL」になる原因の切り分け用）
+    pyi_env = {k: v for k, v in os.environ.items()
+               if k.startswith("_PYI") or k.startswith("_MEI")}
     with open(path, "w", encoding="utf-8") as f:
         f.write(f"version={__version__}\n")
         f.write(f"api={UPDATE_API_URL}\n")
         f.write(f"certifi={ca_info}\n")
         f.write(f"watchdog={wd}\n")
+        f.write(f"pyi_env={pyi_env}\n")
         if info:
             f.write(f"result=OK remote={info['version']}\n")
         else:
