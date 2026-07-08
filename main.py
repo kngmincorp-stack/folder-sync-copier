@@ -22,6 +22,11 @@ from watcher import CopyPair, WatchEngine
 
 
 class App(tk.Tk):
+    # 自動起動時、監視元(ネットワークドライブ等)が見えるまで再確認する間隔（秒）
+    AUTOSTART_RETRY_SEC = 10
+    # この回数待っても一部の監視元しか見えない場合は、見える組だけで開始する
+    AUTOSTART_PARTIAL_AFTER = 12
+
     def __init__(self, autostart=False):
         super().__init__()
         self.title(f"{APP_TITLE}  v{__version__}")
@@ -65,8 +70,9 @@ class App(tk.Tk):
                 self._log("[スタートアップ] 警告: タスクマネージャーで無効化されています。")
 
         # スタートアップ起動時は自動で監視開始
+        self._autostart_tries = 0
         if autostart:
-            self.after(300, self._start)
+            self.after(300, lambda: self._start(autostart=True))
 
     # ---------- UI 構築 ----------
     def _build_ui(self):
@@ -173,10 +179,37 @@ class App(tk.Tk):
         self.cfg["startup"] = self.startup_var.get()
         config.save(self.cfg)
 
-    def _start(self):
+    def _start(self, autostart=False):
+        if self.engine.running:
+            return
         pairs = self._collect_pairs()
+        configured = [p for p in pairs if p.src or p.dst]
         valid = [p for p in pairs if p.valid()]
+
+        # PC 起動直後はネットワークドライブ(W: 等)の再接続がアプリ起動より遅く、
+        # 監視元が一時的に「存在しない」と判定される。自動起動時はダイアログを
+        # 出さず、監視元が見えるまで待ってから開始する。
+        if autostart and configured and len(valid) < len(configured):
+            self._autostart_tries += 1
+            missing = [p.src for p in configured if not p.valid()]
+            if not valid or self._autostart_tries <= self.AUTOSTART_PARTIAL_AFTER:
+                if self._autostart_tries == 1 or self._autostart_tries % 6 == 0:
+                    self._log(f"[自動起動] 監視元がまだ見つかりません（ネットワークドライブ接続待ち）: "
+                              f"{'、'.join(missing)}")
+                    self._log(f"[自動起動] {self.AUTOSTART_RETRY_SEC} 秒ごとに再確認し、"
+                              "見つかり次第自動で監視を開始します。")
+                self.after(self.AUTOSTART_RETRY_SEC * 1000,
+                           lambda: self._start(autostart=True))
+                return
+            # 十分待っても一部だけ見えない → 見える組だけで開始
+            for m in missing:
+                self._log(f"[自動起動] {m} が見つからないため、この組はスキップして開始します。")
+
         if not valid:
+            if autostart:
+                self._log("[自動起動] 監視ペアが設定されていないため開始できません。"
+                          "フォルダを指定して［監視開始］を押してください。")
+                return
             messagebox.showwarning("設定不足",
                                    "有効な監視元フォルダとコピー先フォルダを\n少なくとも 1 組指定してください。")
             return
