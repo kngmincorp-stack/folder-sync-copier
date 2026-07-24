@@ -38,7 +38,7 @@ if not defined DRYRUN (
 
 REM ---- build ----
 echo [1/4] building exe...
-python -m PyInstaller --noconfirm --onefile --windowed --name "FolderSyncCopier" --hidden-import tkinter --hidden-import certifi --collect-data certifi --collect-all watchdog main.py >nul
+python -m PyInstaller --noconfirm --onefile --windowed --name "FolderSyncCopier" --hidden-import tkinter --hidden-import certifi --collect-data certifi --collect-all watchdog --hidden-import pystray._win32 --collect-submodules pystray main.py >nul
 if errorlevel 1 (
     echo [ERROR] build failed
     exit /b 1

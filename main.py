@@ -8,6 +8,7 @@
 ・パッチ更新システム（GitHub Releases 参照）
 """
 import sys
+import ctypes
 import queue
 import threading
 import datetime
@@ -17,8 +18,15 @@ from tkinter import ttk, filedialog, messagebox
 import config
 import startup
 import updater
-from version import __version__, APP_TITLE, UPDATE_API_URL
+from version import __version__, APP_NAME, APP_TITLE, UPDATE_API_URL
 from watcher import CopyPair, WatchEngine
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except Exception:
+    HAS_TRAY = False
 
 
 class App(tk.Tk):
@@ -69,9 +77,16 @@ class App(tk.Tk):
             if not startup.is_approved():
                 self._log("[スタートアップ] 警告: タスクマネージャーで無効化されています。")
 
-        # スタートアップ起動時は自動で監視開始
+        # タスクトレイ常駐（×ボタンで終了せずトレイへ、監視は継続する）
+        self._tray_icon = None
+        self._quitting = False
+        self._create_tray_icon()
+
+        # スタートアップ起動時は自動で監視開始（ウィンドウは出さずトレイ常駐）
         self._autostart_tries = 0
         if autostart:
+            if HAS_TRAY:
+                self.withdraw()
             self.after(300, lambda: self._start(autostart=True))
 
     # ---------- UI 構築 ----------
@@ -304,7 +319,11 @@ class App(tk.Tk):
             messagebox.showwarning("更新", detail)
 
     def _quit_for_update(self):
+        if self._quitting:
+            return
+        self._quitting = True
         self.engine.stop()
+        self._stop_tray()
         self.destroy()
         sys.exit(0)
 
@@ -328,10 +347,69 @@ class App(tk.Tk):
             pass
         self.after(150, self._drain_log)
 
+    # ---------- トレイ常駐 ----------
+    def _tray_image(self):
+        img = Image.new("RGB", (64, 64), "#2e8b57")
+        d = ImageDraw.Draw(img)
+        # フォルダ 2 つ＋矢印風のシンプルなアイコン
+        d.rectangle((8, 14, 30, 34), fill="#ffffff")
+        d.rectangle((34, 30, 56, 50), fill="#d6f5d6")
+        d.polygon([(24, 40), (36, 40), (30, 50)], fill="#ffffff")
+        return img
+
+    def _create_tray_icon(self):
+        if not HAS_TRAY:
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem("開く", lambda: self.after(0, self._show_window), default=True),
+            pystray.MenuItem("終了", lambda: self.after(0, self._quit_app)),
+        )
+        self._tray_icon = pystray.Icon(APP_TITLE, self._tray_image(), APP_TITLE, menu)
+
+        def run_tray(icon=self._tray_icon):
+            try:
+                icon.run()
+            except Exception:
+                # トレイスレッドが死んだら×ボタンを「終了」に戻す
+                # （withdraw すると開く手段が無くなるため）
+                self._tray_icon = None
+
+        threading.Thread(target=run_tray, daemon=True).start()
+
+    def _show_window(self):
+        self.deiconify()
+        self.lift()
+        try:
+            self.focus_force()
+        except tk.TclError:
+            pass
+
+    def _stop_tray(self):
+        if self._tray_icon:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
+
     # ---------- 終了 ----------
     def _on_close(self):
         self._save_cfg()
+        if HAS_TRAY and self._tray_icon:
+            # ×ボタンでは終了せずトレイへ格納する（監視は継続）
+            if self.engine.running:
+                self._log("ウィンドウをトレイに格納しました。監視は継続しています。")
+            self.withdraw()
+        else:
+            self._quit_app()
+
+    def _quit_app(self):
+        if self._quitting:
+            return
+        self._quitting = True
+        self._save_cfg()
         self.engine.stop()
+        self._stop_tray()
         self.destroy()
 
 
@@ -423,6 +501,15 @@ def _selftest_realtime():
         shutil.rmtree(dst, ignore_errors=True)
 
 
+def _acquire_single_instance() -> bool:
+    """名前付きミューテックスで二重起動を防止。既に起動済みなら False。
+    トレイ常駐化でウィンドウが見えず「起動していない」と誤解して再起動
+    →二重監視（同一コピー先へ同時書き込み）になる事故を防ぐ。"""
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW(None, False, f"Local\\{APP_NAME}_single_instance")
+    return kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+
+
 def main():
     if "--selftest-update" in sys.argv:
         _selftest_update()
@@ -434,6 +521,13 @@ def main():
         _selftest_apply()
         return
     autostart = "--autostart" in sys.argv
+    if not _acquire_single_instance():
+        if not autostart:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                f"{APP_TITLE}は既に起動しています。\nタスクトレイのアイコンから開いてください。",
+                APP_TITLE, 0x40)
+        return
     app = App(autostart=autostart)
     app.mainloop()
 
